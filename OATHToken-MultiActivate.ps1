@@ -20,7 +20,7 @@
         License : MIT License
 
     .LINK
-        https://github.com/deofex
+        https://github.com/Deofex/ActivateOATHTokensInBulkAzure
 #>
 param
 (
