@@ -328,13 +328,17 @@ function test-validityaccesstoken {
 
 <#
     .SYNOPSIS
-        Get a list with all OATH tokens in Azure
+        Get a list with unactivated OATH tokens in Azure for 1 (or all) user(s) in Azure
 
     .DESCRIPTION
-        This function collects a list with OATH tokens available in the Azure tenant where the given OAUTH token is available
+        This function collects a list with OATH tokens available in the Azure tenant where the given OAUTH token is available.
+        The maximum results of tokens which can be returned is 25
 
     .PARAMETER accesstoken
         A string which contains the access token of tenant from where to collect the OATH tokens
+
+    .PARAMETER upn
+        A string which contains the UPN of the user.
 
     .INPUTS
         None.
@@ -343,20 +347,24 @@ function test-validityaccesstoken {
         System.Management.Automation.PSobject - which includes OATH token information
 
     .EXAMPLE
-        PS C:\> get-oathtokens -accesstoken '12312fsdfada......'
-        Returns a list with OATH tokens and information
+        PS C:\> get-oathtokens -accesstoken '12312fsdfada......' -upn '106@m31231232.onmicrosoft.com'
+        Returns a list with unactivated OATH tokens and information for the user '106@m31231232.onmicrosoft.com'
 
 #>
-function get-oathtokens {
+function get-unactivatedoathtokens {
     [CmdletBinding()]
     param
     (
         # The OATH access token
         [Parameter(Mandatory = $true)]
         [System.String]
-        $accesstoken
+        $accesstoken,
+        # The UPN of the user to retrieve a token from
+        [Parameter(Mandatory = $false)]
+        [System.String]
+        $upn
     )
-    $apiUrl = 'https://main.iam.ad.ext.azure.com/api/MultifactorAuthentication/HardwareToken/users?skipToken=&upn=&enabledFilter='
+    $apiUrl = 'https://main.iam.ad.ext.azure.com/api/MultifactorAuthentication/HardwareToken/users?skipToken=&upn=' + $upn + '&enabledFilter=false'
 
     $header = @{
         'Authorization'          = "Bearer $accesstoken"
@@ -369,7 +377,7 @@ function get-oathtokens {
     $Data = (Invoke-RestMethod -Headers $header -Uri $apiUrl -Method Get).items
 
 
-    write-verbose "Er zijn $($data.count) OATH tokens gevonden, hiervan zijn er $(($data | where-object {$_.enabled -eq $false}).count) niet enabled"
+    write-verbose "There are $($data.count) OATH tokens found for the user: $upn"
     return $data
 }
 
@@ -466,19 +474,18 @@ try {
     $oathcsv = import-csv $csvfile -ErrorAction Stop
 }
 catch {
-    write-host "CSV kan niet geimporteerd worden. Stop script."
+    write-host "CSV can't be imported. Stop script."
     exit
 }
 
 # Retrieve the OAUTH token for the OATH tokens resource in the given tenant (user will be asked to authorize this request via a browser)
 $resourceid = "74658136-14ec-4630-ad9b-26e160ff0fc6"
+
+# Get OAuth key for requested tenant ID
 $oauthtokens = get-oauthtokens -tenantId $tenantId -resourceid $resourceid
 
-# Retrieve the OATH tokens in Azure and filter only the not-activated tokens
-$unactivatedoathtokens = get-oathtokens -accesstoken $oauthtokens.access_token | where-object { $_.enabled -eq $false }
-
-# Foreach unactivated OATH token, go into a loop
-foreach ($oathtoken in $unactivatedoathtokens) {
+# Go through the inserted CSV file
+foreach ($oathtoken in $oathcsv) {
     # Renew the OAuth token when it's expired
     if (test-validityaccesstoken -expiredate $oauthtokens.expires_on) {
         Write-Verbose "Access token is valid."
@@ -487,21 +494,22 @@ foreach ($oathtoken in $unactivatedoathtokens) {
         Write-Verbose "Access token is expired or will soon expire, get a new token with the refresh token"
         $oauthtokens = get-oauthtokensviarefreshtoken -refreshtoken $oauthtokens.refresh_token
     }
+    Write-Verbose "Found user $($oathtoken.upn) in CSV. Processing...."
+    $unactivatedoathtoken = $null
+    $unactivatedoathtoken = get-unactivatedoathtokens -accesstoken $oauthtokens.access_token -upn $oathtoken.upn | where-object { $_.serialnumber -eq $oathtoken.'serial number' }
 
-    if (@($oathcsv | Where-Object { $_."serial number" -eq $oathtoken.serialNumber }).count -eq 1) {
-        write-verbose "Private OATH info found in the CSV for user $($oathtoken.displayname), proceeding with activation for this token"
-        $oathsecretinfo = $oathcsv | Where-Object { $_."serial number" -eq $oathtoken.serialNumber }
-        # Activate the OATH token
+    if ($unactivatedoathtoken) {
+        Write-Verbose "$($unactivatedoathtokens.count) unactivated tokens found for user $($oathtoken.upn). Activating"
         try {
-            new-oathtokenactivation -accesstoken $oauthtokens.access_token -oathId $oathtoken.oathId -objectid $oathtoken.objectId -secretkey $oathsecretinfo.'secret key' -Interval $oathsecretinfo.'time interval' | Out-Null
-            write-host "Token is succesfully acgtivated for $($oathtoken.displayname)" -ForegroundColor Green
+            new-oathtokenactivation -accesstoken $oauthtokens.access_token -oathId $unactivatedoathtoken.oathId -objectid $unactivatedoathtoken.objectId -secretkey $oathtoken.'secret key' -Interval $oathtoken.'time interval' | Out-Null
+            write-host "Token is succesfully activated for $($oathtoken.upn)" -ForegroundColor Green
         }
         catch {
-            write-host "Token can't be activated for $($oathtoken.displayname). Error $($_.Exception.Message)" -ForegroundColor Red
+            write-host "Token can't be activated for $($oathtoken.upn). Error $($_.Exception.Message)" -ForegroundColor Red
         }
     }
     else {
-        write-host "No secret OATH information found for $($oathtoken.displayname). This info is not in the CSV or the CSV lacks the correct headers. Activation will not proceed for this user"
+        write-verbose "No unactivated token found for user: $($oathtoken.upn) en serial number: $($oathtoken.'serial number') "
     }
-}
 
+}
